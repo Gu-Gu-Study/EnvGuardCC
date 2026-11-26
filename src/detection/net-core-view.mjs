@@ -353,10 +353,20 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
     conclusion.detail = [conclusion.detail, t("检测到多个网络同时在线（例如同时连有线和无线），出口可能抖动；建议只保留一条网络。", "Multiple networks are online (e.g. Ethernet and Wi-Fi); the exit may flap. Keeping a single link is recommended.")]
       .filter(Boolean).join(zh ? " " : " ");
   }
-  // 宿主暂时探测不到：保持宿主模式，不降级自起内核（否则会抢 39090/TUN）。
-  if (report.hostProbeFailed === true || report.hostHeartbeatError) {
-    conclusion.detail = [conclusion.detail, t("特权宿主暂时无响应，已在保持现有模式；稍后重试即可，不会另起一个内核。", "The privileged helper is temporarily unresponsive; the current mode is kept. Retry shortly — no second kernel is started.")]
-      .filter(Boolean).join(zh ? " " : " ");
+  const hostStatus = report.hostStatus ?? (report.hostStale ? "stale" : null);
+  const hostIssue = {
+    unreachable: report.hostRepairable === true
+      ? t("系统助手未运行，请授权修复系统助手。", "The system helper is not running. Authorize a repair of the system helper.")
+      : t("系统助手未运行，请检查助手运行状态。", "The system helper is not running. Check the helper's running state."),
+    unresponsive: t("系统助手未及时响应，尚不能确认其运行状态；请稍后重试。", "The system helper did not respond in time; its running state is unconfirmed. Retry shortly."),
+    unauthorized: t("系统助手认证失败，请重新授权安装。", "System helper authentication failed. Authorize helper installation again."),
+    stale: t("特权助手版本不匹配：开启环境防护时会请求系统授权更新；版本一致后直接复用。", "The privileged helper version does not match: enabling protection will request system authorization to update it; matching versions are reused."),
+  }[hostStatus] ?? null;
+  if (hostIssue || report.hostProbeFailed === true || report.hostHeartbeatError) {
+    conclusion.detail = [conclusion.detail, hostIssue ?? (report.hostHeartbeatError
+      ? t("特权宿主暂时无响应，保留现有模式并等待心跳恢复。", "The privileged helper is temporarily unresponsive; the current mode is kept while waiting for heartbeat recovery.")
+      : t("特权宿主探测失败，尚不能确认其状态；请查看失败原因后重试。", "The privileged helper probe failed; its status is unconfirmed. Review the failure reason and retry."))]
+      .filter(Boolean).join(" ");
     if (tone === "ok") { tone = "warn"; conclusion.tone = "warn"; }
   }
 
@@ -366,10 +376,9 @@ export function netCoreView(report, { locale = "zh", exitHistory = null } = {}) 
   }));
 
   // 未启用 TUN 时必须说明原因，而不是让用户以为内核坏了。
-  const hostStaleHint = !hostMode && report.hostStale
-    ? t("特权助手版本不匹配：开启环境防护时会请求系统授权更新；版本一致后直接复用。", "The privileged helper version does not match: enabling protection will request system authorization to update it; matching versions are reused.")
-    : null;
-  const tunHint = hostStaleHint ?? (state === "running" && !tunEnabled
+  const tunHint = hostIssue ?? (report.hostRepairable === true
+    ? t("系统助手未运行，请授权修复系统助手。", "The system helper is not running. Authorize a repair of the system helper.")
+    : null) ?? (state === "running" && !tunEnabled
     ? (hostMode
       ? t("系统接管已关闭，内核仍可提供本机代理；开启接管后会重新验证隧道。", "System capture is off; the kernel still provides a local proxy. Enabling capture will reverify the tunnel.")
       : (elevated !== true

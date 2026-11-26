@@ -530,6 +530,82 @@ test('网络配置集中到设置，保护占用隧道时仍禁止单独切换�
   assert.match(workspace('active'), />选择浏览器</);
 });
 
+test('宿主未运行时即使内核未启动或使用管理员权限也提供明确修复入口', () => {
+  const { NetCoreSettings } = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
+  for (const locale of ['zh', 'en']) {
+    for (const elevated of [false, true]) {
+      let authorized = false, click;
+      const jsxRuntime = require('react/jsx-runtime');
+      const nativeJsx = jsxRuntime.jsx;
+      jsxRuntime.jsx = (type, props, ...rest) => {
+        if (type === 'button' && props.className === 'repair-button netcore-authorize') click = props.onClick;
+        return nativeJsx(type, props, ...rest);
+      };
+      const props = { locale, busy: false, report: { state: 'idle', nodes: [], hostMode: true, hostStatus: 'unreachable', hostRepairable: true, elevation: { platform: 'win32', elevated } }, onAuthorizeHost() { authorized = true; } };
+      try {
+        const html = renderToStaticMarkup(React.createElement(NetCoreSettings, props));
+        assert.match(html, locale === 'zh' ? /系统助手未运行/ : /system helper is not running/);
+        const repair = html.match(/<button[^>]*class="repair-button netcore-authorize"[^>]*>[\s\S]*?<\/button>/)?.[0];
+        assert.ok(repair);
+        assert.doesNotMatch(repair, /disabled=""/);
+        assert.match(repair, locale === 'zh' ? /修复系统助手/ : /Repair system helper/);
+        click(); assert.equal(authorized, true);
+        const pending = renderToStaticMarkup(React.createElement(NetCoreSettings, { ...props, busy: true }));
+        assert.match(pending.match(/<button[^>]*class="repair-button netcore-authorize"[^>]*>/)?.[0] ?? '', /disabled=""/);
+      } finally { jsxRuntime.jsx = nativeJsx; }
+    }
+  }
+});
+
+test('超时提示真实原因且无授权按钮，认证失败保留原重新授权入口', () => {
+  const { NetCoreSettings } = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
+  for (const [hostStatus, zh, en] of [['unresponsive', '未及时响应', 'did not respond in time'], ['unauthorized', '认证失败', 'authentication failed']]) {
+    for (const locale of ['zh', 'en']) {
+      const report = { state: 'running', nodes: [], tunEnabled: false, hostMode: false, hostStatus, hostRepairable: false, hostProbeFailed: true, elevation: { platform: 'win32', elevated: false } };
+      const html = renderToStaticMarkup(React.createElement(NetCoreSettings, { locale, busy: false, report, onAuthorizeHost() {} }));
+      assert.ok(html.includes(locale === 'zh' ? zh : en));
+      assert.doesNotMatch(html, /修复系统助手|Repair system helper/);
+      if (hostStatus === 'unresponsive') assert.doesNotMatch(html, /netcore-authorize|授权安装|Authorize helper/);
+      else assert.match(html, locale === 'zh' ? /netcore-authorize[^>]*>授权安装特权助手<\/button>/ : /netcore-authorize[^>]*>Authorize helper<\/button>/);
+      const view = require(path.join(root, 'src/detection/net-core-view.mjs')).netCoreView(report, { locale });
+      assert.ok(view.conclusion.detail.includes(locale === 'zh' ? zh : en));
+      assert.doesNotMatch(view.conclusion.detail, /版本不匹配|version does not match/);
+    }
+  }
+});
+
+test('普通缺失宿主仍保留非管理员授权安装入口', () => {
+  const { NetCoreSettings } = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
+  const html = renderToStaticMarkup(React.createElement(NetCoreSettings, { locale: 'zh', busy: false, report: { state: 'running', hostMode: false, hostStatus: 'missing', tunEnabled: false, elevation: { platform: 'win32', elevated: false } }, onAuthorizeHost() {} }));
+  assert.match(html, /netcore-authorize[^>]*>授权安装特权助手<\/button>/);
+});
+
+test('修复授权对话框说明重新安装并继续，中英文按钮可确认且忙碌时锁定', () => {
+  for (const locale of ['zh', 'en']) {
+    let authorized = false, click;
+    const jsxRuntime = require('react/jsx-runtime');
+    const nativeJsx = jsxRuntime.jsx;
+    jsxRuntime.jsx = (type, props, ...rest) => {
+      if (type === 'button' && props.className === 'repair-button repair-button--primary') click = props.onClick;
+      return nativeJsx(type, props, ...rest);
+    };
+    const props = { locale, platform: 'win32', mode: 'repair', error: '', busy: false, onAuthorize() { authorized = true; }, onClose() {} };
+    try {
+      const html = renderToStaticMarkup(React.createElement(HostAuthorizationDialog, props));
+      assert.match(html, locale === 'zh' ? /系统助手未运行.*重新安装修复助手.*继续/ : /system helper is not running.*reinstall and repair.*continues/);
+      assert.match(html, locale === 'zh' ? /授权修复并继续/ : /Authorize repair &amp; continue/);
+      assert.doesNotMatch(html, /首次启用|First-time setup|授权并启用隧道|Authorize &amp; enable tunnel/);
+      click(); assert.equal(authorized, true);
+      const pending = renderToStaticMarkup(React.createElement(HostAuthorizationDialog, { ...props, busy: true, error: 'repair failed' }));
+      const buttons = pending.match(/<button[^>]*>/g) ?? [];
+      assert.equal(buttons.length, 3);
+      for (const button of buttons) assert.match(button, /disabled=""/);
+      assert.match(pending, /role="status"/);
+      assert.match(pending, /role="alert">repair failed/);
+    } finally { jsxRuntime.jsx = nativeJsx; }
+  }
+});
+
 test('已开启的严格模式在平台或节点不可用时仍可从设置恢复联网', () => {
   const {NetCoreSettings} = require(path.join(root, 'src/components/detector/NetCoreSettings.tsx'));
   const props = { locale: 'zh', busy: false, tunnelLocked: false, report: { state: 'unavailable', nodes: [], strictMode: true, guard: { armed: true, phase: 'blocked' }, elevation: { platform: 'win32', elevated: false } }, onStrictChange: () => {} };

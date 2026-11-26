@@ -112,7 +112,7 @@ export function NetCoreSettings({ locale, report, busy, error, tunnelLocked, net
       </section>}
 
     </section>
-    {view.tunHint && <div className="netcore-alert" role="status">{view.tunHint}{onAuthorizeHost && ['darwin', 'win32'].includes(view.platform ?? '') && view.hostMode === false && view.elevated === false && <button type="button" className="repair-button netcore-authorize" onClick={onAuthorizeHost} disabled={busy}>{text('授权安装特权助手', 'Authorize helper')}</button>}</div>}
+    {view.tunHint && <div className="netcore-alert" role="status">{view.tunHint}{onAuthorizeHost && (report?.hostRepairable === true || (!['unreachable', 'unresponsive'].includes(report?.hostStatus ?? '') && ['darwin', 'win32'].includes(view.platform ?? '') && view.hostMode === false && view.elevated === false)) && <button type="button" className="repair-button netcore-authorize" onClick={onAuthorizeHost} disabled={busy}>{report?.hostRepairable ? text('修复系统助手', 'Repair system helper') : text('授权安装特权助手', 'Authorize helper')}</button>}</div>}
     {error && <p className="netcore-alert" role="alert">{error}</p>}
   </>;
 }

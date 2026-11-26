@@ -80,6 +80,10 @@ export type NetCoreReport = {
   state: "disabled" | "idle" | "running" | "error" | "unavailable" | string;
   reason?: string | null; detail?: string;
   tunEnabled?: boolean; tunCaptured?: boolean | null; hostMode?: boolean; demo?: boolean;
+  hostStatus?: "ready" | "missing" | "unreachable" | "unresponsive" | "unauthorized" | "stale";
+  /** 仅明确拒绝连接的 Windows 宿主允许用户授权修复。 */
+  hostRepairable?: boolean;
+  hostProbeFailed?: boolean; hostStale?: boolean; hostHeartbeatError?: string | null;
   networkGeneration?: number; lastHealthAt?: string | null;
   capabilities?: { independentProxy: boolean; systemKillSwitch: boolean; strictTravel: boolean };
   strictMode?: boolean;

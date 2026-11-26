@@ -261,7 +261,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
   const binary = await resolveKernelBinary({ stateDir, env, platform, root });
   const networkTakeover = takeover ?? createNetworkTakeover({ platform, ownBinary: binary });
   // 特权宿主模式：优先用显式环境变量；否则尝试读取安装器写入的令牌并探测宿主健康。
-  // 探测失败就回退本机 spawn，避免"装了但没跑起来"时整个网络面板不可用。
+  // 令牌仅代表已有凭据；探测失败时保留宿主责任，不自起第二个内核。
   let hostUrl = env.CHECKCC_NET_CORE_HOST || null;
   let hostToken = env.CHECKCC_NET_CORE_HOST_TOKEN || null;
   let hostGuard = null;
@@ -276,6 +276,17 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
   // 探测不确定（超时/连接中断）：保持宿主模式，避免降级后自起内核抢同一套端口。
   let hostProbeInconclusive = false;
   let hungHost = false;
+  let hostStatus = 'missing';
+  const hostRepairable = () => platform === 'win32' && hostStatus === 'unreachable';
+  const hostUnavailableReason = () => hostRepairable()
+    ? '特权助手未运行，请授权修复系统助手。'
+    : hostStatus === 'unresponsive' || hostStatus === 'unreachable'
+      ? '特权宿主探测超时或暂时无响应，等待自动重试。'
+      : hostStatus === 'unauthorized'
+        ? '特权助手拒绝现有凭据，请重新授权修复。'
+        : hostStatus === 'stale'
+          ? '特权助手版本不匹配，请授权更新系统助手。'
+          : '系统阻断需要特权助手，请先授权安装。';
   /** 重新探测特权宿主：装宿主与启动应用有先后关系，不能在构造时探一次就定终身。 */
   async function detectHost(previous = false) {
     hostStale = null;
@@ -291,6 +302,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
         // An explicit authentication rejection is a changed credential/permission,
         // not a startup delay. It may require a new user-authorized installation.
         hostProbeInconclusive = hostConfigured && ![401, 403].includes(health.status);
+        hostStatus = hostProbeInconclusive ? 'unresponsive' : 'unauthorized';
         if (!hostProbeInconclusive) logger('[net-core] 特权宿主拒绝现有凭据，需要重新授权修复。');
         return false;
       }
@@ -303,15 +315,20 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
       hostBuildVersion = negotiated.buildVersion;
       hostCapabilities = negotiated.capabilities;
       if (!negotiated.ok) {
+        hostStatus = 'stale';
         hostStale = negotiated;
         logger(`[net-core] 特权宿主版本过旧或不匹配（协议 ${negotiated.protocol || "未知"}/${negotiated.required}，代码 ${negotiated.buildVersion?.slice(0, 12) ?? "未知"}/${negotiated.requiredBuildVersion.slice(0, 12)}${negotiated.missing.length ? `，缺少 ${negotiated.missing.join("/")}` : ""}）：开启保护时会请求一次系统授权更新。`);
         return false;
       }
+      hostStatus = 'ready';
+      hostInstallFailure = null;
       return true;
     } catch (error) {
-      // 有安装凭据或曾经可用时，探测失败不能证明未安装；冷启动同样禁止盲目降级。
+      // 凭据不证明安装成功；连接拒绝允许用户主动修复，超时仍不能证明进程已退出。
       hostProbeInconclusive = hostConfigured;
-      if (hostConfigured) logger(`[net-core] 特权宿主探测失败（${error.message}）：等待宿主恢复，暂不降级到本机内核。`);
+      const refused = error.code === 'ECONNREFUSED' || error.cause?.code === 'ECONNREFUSED';
+      hostStatus = !hostConfigured ? 'missing' : refused ? 'unreachable' : 'unresponsive';
+      if (hostConfigured) logger(`[net-core] 特权宿主探测失败（${error.message}）：${hostUnavailableReason()} 暂不降级到本机内核。`);
       return false;
     }
   }
@@ -1239,7 +1256,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
   let nextGuardActionAt = 0;
   const failClosedEnabled = () => platform === 'win32' && hostMode && hostCapabilities.includes("claude-direct-guard") && env.CHECKCC_CLAUDE_FAILCLOSED !== "0";
   function requireWindowsGuard() {
-    if (platform === 'win32' && env.CHECKCC_CLAUDE_FAILCLOSED !== '0' && !failClosedEnabled()) throw new Error('Windows 系统接管需要新版特权宿主提供桌面直连阻断，请开启环境防护并授权更新助手。');
+    if (platform === 'win32' && env.CHECKCC_CLAUDE_FAILCLOSED !== '0' && (hungHost || !failClosedEnabled())) throw new Error(hostUnavailableReason());
   }
 
   // 建立常驻阻断失败后短暂退避：一次 protect 要跑 PowerShell（实测 9~75 秒），
@@ -1459,7 +1476,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
     const previousHostMode = hostMode;
     const host = await refreshHost();
     // 启动和后台重建也必须保留已确认的宿主模式；未知状态只等待重试。
-    if (host.inconclusive) throw new Error('特权宿主探测超时或暂时无响应，等待自动重试。');
+    if (host.inconclusive) throw new Error(hostUnavailableReason());
     if (hostMode !== previousHostMode) logger(`[net-core] 特权宿主状态变化：${hostMode ? "不可用 → 可用" : "可用 → 不可用"}。`);
     tunEnabled = strictEnabled || (tunOverride ?? resolveTunEnabled());
     if (tunEnabled && !windowsClaudeGuardReady()) await ensureWindowsClaudeGuard();
@@ -1924,6 +1941,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
       hostProtocol, hostBuildVersion, hostCapabilities, hostStale: hostStale ? { ...hostStale } : null,
       // 宿主暂时探测不到（超时）时不再降级成本机模式；界面需要能说清“在等宿主”。
       hostProbeFailed: hungHost,
+      hostStatus, hostRepairable: hostRepairable(),
       hostHeartbeatError: hostHeartbeatError ? { ...hostHeartbeatError } : null,
       nodes: Array.isArray(nodes?.proxies) ? nodes.proxies.map((node) => node.name) : [],
       selected: nodes?.selected ?? null,
@@ -2216,7 +2234,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
    * 之后每次开启保护都不再需要授权。
    */
   async function ensurePrivilegedHost({ reason = "启动环境防护" } = {}) {
-    if (hungHost && !hostMode) throw new Error('特权宿主探测超时或暂时无响应，等待自动重试。');
+    if (hungHost) throw new Error(hostUnavailableReason());
     const decision = hostInstallDecision({
       hostMode, platform,
       // Windows 的持久桌面阻断由宿主管理，管理员运行也不能跳过宿主安装。
@@ -2246,21 +2264,36 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
    * 应用内安装特权宿主：macOS 走系统授权弹窗（密码/Touch ID 不经过应用）。
    * 路径只来自服务端，HTTP 请求无法指定要执行什么。
    */
-  async function installHost() {
-    // This endpoint is also reached from stale UI dialogs and concurrent requests.
-    // Recheck the authenticated host before entering UAC, including after relaunch.
+  async function installHost({ repair = false } = {}) {
+    // 每次用户操作都先重新验证：恢复的宿主直接复用，只有明确连接拒绝才允许修复。
     const current = await refreshHost();
-    if (current.inconclusive) throw new Error('特权宿主暂时无响应，正在等待恢复；无需重复授权安装。');
-    if (hostMode) return { installed: false, reused: true, ...current };
-    if (!binary) throw new Error("未找到内核二进制，请先准备内核。");
-    const installKernelHost = hostInstaller ?? (await import("./host-install.mjs")).installKernelHost;
-    const result = await installKernelHost({ stateDir, binary, platform });
-    const host = await refreshHost();
-    if (!hostMode || host.inconclusive) {
-      hostInstallFailure = "特权助手安装后版本或健康状态未通过验证；请检查安装日志后重试。";
-      throw new Error(hostInstallFailure);
+    if (current.inconclusive && !(repair && hostRepairable())) {
+      throw new Error('特权宿主暂时无响应，正在等待恢复；无需重复授权安装。');
     }
-    return { ...result, ...host };
+    if (hostMode && !current.inconclusive) return { installed: false, reused: true, ...current };
+    if (!binary) throw new Error("未找到内核二进制，请先准备内核。");
+    try {
+      const installKernelHost = hostInstaller ?? (await import("./host-install.mjs")).installKernelHost;
+      const result = await installKernelHost({ stateDir, binary, platform });
+      const host = await refreshHost();
+      if (!hostMode || host.inconclusive) {
+        throw new Error('特权助手安装后版本或健康状态未通过验证；请检查安装日志后重试。');
+      }
+      hostInstallFailure = null;
+      return { ...result, ...host };
+    } catch (error) {
+      hostInstallFailure = error.message;
+      throw error;
+    }
+  }
+  let hostInstallRequest = null;
+  function requestHostInstall() {
+    if (hostInstallRequest) return hostInstallRequest;
+    const pending = serialize(() => installHost({ repair: true }))();
+    hostInstallRequest = pending;
+    const clear = () => { if (hostInstallRequest === pending) hostInstallRequest = null; };
+    pending.then(clear, clear);
+    return pending;
   }
 
   /**
@@ -3029,7 +3062,7 @@ export async function createKernelRuntime({ stateDir, initialTunnel, env = proce
       } finally { await rm(temporary, { force: true }); }
       return result;
     }),
-    probeNodeExits: serialize(probeNodeExits), probeSelectedExit: serialize(probeSelectedExit), unlockRegion: serialize(unlockRegion), setNetworkFailurePolicy: serialize(setNetworkFailurePolicy), setUnprotectedGuard: serialize(setUnprotectedGuard), refreshHost: serialize(refreshHost), installHost: serialize(installHost),
+    probeNodeExits: serialize(probeNodeExits), probeSelectedExit: serialize(probeSelectedExit), unlockRegion: serialize(unlockRegion), setNetworkFailurePolicy: serialize(setNetworkFailurePolicy), setUnprotectedGuard: serialize(setUnprotectedGuard), refreshHost: serialize(refreshHost), installHost: requestHostInstall,
     // 启动期抑制 hosts 阻断：桌面层已确认本次启动会开保护时打开，避免启动窗口写一次又清一次。
     setHostsSuppressed: value => { hostsSuppressed = value === true; return { suppressed: hostsSuppressed }; },
     setStrictMode: serialize(async enabled => {

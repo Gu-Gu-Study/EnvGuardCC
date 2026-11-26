@@ -26,13 +26,14 @@ async function startFakeHost(payload, status = 200) {
   return { port: server.address().port, close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
-async function createRuntime(port, savedStateDir = null, hostInstaller = async () => { throw new Error('test-install-attempt'); }) {
+async function createRuntime(port, savedStateDir = null, hostInstaller = async () => { throw new Error('test-install-attempt'); }, fetchImpl) {
   const stateDir = savedStateDir ?? await mkdtemp(path.join(tmpdir(), "checkcc-host-upgrade-"));
   await writeFile(path.join(stateDir, "host-token"), "token-token-token-token\n");
   const logs = [];
   const runtime = await createKernelRuntime({
     stateDir, platform: 'win32',
-    hostInstaller,
+    hostInstaller, fetchImpl,
+    egressInterface: { warm() {} },
     root,
     env: { CHECKCC_NET_CORE: "0", CHECKCC_NET_CORE_BINARY: process.execPath, CHECKCC_NET_CORE_HOST_PORT: String(port) },
     logger: (message) => logs.push(message),
@@ -63,15 +64,82 @@ test('宿主明确拒绝凭据时允许进入修复，不误报暂时离线', as
   } finally { await first.cleanup(); await host.close(); }
 });
 
-test('凭据存在但宿主暂时离线，重复安装入口不弹 UAC', async () => {
-  const host = await startFakeHost({ ok: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: [...HOST_CAPABILITIES] });
-  const first = await createRuntime(host.port);
-  await host.close();
+test('残留凭据且连接拒绝：后台不安装，主动修复可重试且并发只安装一次', async () => {
+  let healthy = false, installs = 0;
+  const probe = async () => {
+    if (!healthy) throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    return { ok: true, json: async () => ({ ok: true, hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: HOST_CAPABILITIES }) };
+  };
+  const f = await createRuntime(39091, null, async () => {
+    installs++;
+    if (installs === 1) throw new Error('计划任务启动失败');
+    healthy = true;
+    return { installed: true };
+  }, probe);
   try {
-    await assert.rejects(first.runtime.installHost(), /无需重复授权/);
-    const next = await createRuntime(host.port, first.stateDir);
-    await assert.rejects(next.runtime.installHost(), /无需重复授权/);
-  } finally { await first.cleanup(); }
+    const token = await readFile(path.join(f.stateDir, 'host-token'), 'utf8');
+    const offline = await f.runtime.report();
+    assert.equal(offline.hostStatus, 'unreachable');
+    assert.equal(offline.hostRepairable, true);
+    assert.equal(offline.hostStale, null);
+    await f.runtime.refreshHost();
+    await assert.rejects(f.runtime.setUnprotectedGuard(true, { ensureHost: true }), /未运行.*授权修复/);
+    assert.equal(installs, 0, '后台及未保护阻断不自动修复安装');
+    const failed = await Promise.allSettled([f.runtime.installHost(), f.runtime.installHost()]);
+    assert.ok(failed.every(value => value.status === 'rejected' && /计划任务启动失败/.test(value.reason.message)));
+    assert.equal(installs, 1, '并发失败请求共享同一次授权');
+    const results = await Promise.all([f.runtime.installHost(), f.runtime.installHost()]);
+    assert.ok(results.every(value => value.hostMode === true));
+    assert.equal(installs, 2, '用户再次操作可修复，不被上次失败永久阻止');
+    assert.equal((await f.runtime.report()).hostStatus, 'ready');
+    assert.equal((await f.runtime.report()).hostRepairable, false);
+    assert.equal(await readFile(path.join(f.stateDir, 'host-token'), 'utf8'), token);
+    assert.equal((await f.runtime.installHost()).reused, true);
+    assert.equal(installs, 2);
+  } finally { await f.cleanup(); }
+});
+
+test('连接拒绝已恢复则直接复用；冷启动超时、503 或连接中断不触发修复', async () => {
+  let state = 'refused', installs = 0;
+  const f = await createRuntime(39091, null, async () => { installs++; }, async () => {
+    if (state === 'refused') throw Object.assign(new Error('connect ECONNREFUSED'), { cause: { code: 'ECONNREFUSED' } });
+    if (state === 'timeout') throw Object.assign(new Error('timeout'), { name: 'TimeoutError' });
+    if (state === 'reset') throw Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+    if (state === 'busy') return { ok: false, status: 503 };
+    return { ok: true, json: async () => ({ hostProtocol: HOST_PROTOCOL, hostBuildVersion: HOST_BUILD_VERSION, capabilities: HOST_CAPABILITIES }) };
+  });
+  try {
+    assert.equal((await f.runtime.report()).hostRepairable, true);
+    state = 'ready';
+    assert.equal((await f.runtime.installHost()).reused, true, '授权前再探测已经恢复的宿主');
+    for (const failure of ['timeout', 'busy', 'reset']) {
+      state = failure;
+      const next = await createRuntime(39091, f.stateDir, async () => { installs++; }, async () => {
+        if (state === 'busy') return { ok: false, status: 503 };
+        throw Object.assign(new Error(state), { code: state === 'reset' ? 'ECONNRESET' : undefined });
+      });
+      await assert.rejects(next.runtime.installHost(), /无需重复授权/);
+      const report = await next.runtime.report();
+      assert.equal(report.hostStatus, 'unresponsive');
+      assert.equal(report.hostRepairable, false);
+      assert.equal(report.hostProbeFailed, true);
+      await assert.rejects(next.runtime.setUnprotectedGuard(true), /宿主探测超时/);
+    }
+    assert.equal(installs, 0);
+  } finally { await f.cleanup(); }
+});
+
+test('主动修复安装器退出但正式宿主仍拒绝连接，不报告成功', async () => {
+  let installs = 0;
+  const f = await createRuntime(39091, null, async () => { installs++; return { installed: true }; }, async () => {
+    throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+  });
+  try {
+    await assert.rejects(f.runtime.installHost(), /安装后版本或健康状态未通过验证/);
+    assert.equal((await f.runtime.report()).hostStatus, 'unreachable');
+    await assert.rejects(f.runtime.installHost(), /安装后版本或健康状态未通过验证/);
+    assert.equal(installs, 2, '明确操作可重新修复');
+  } finally { await f.cleanup(); }
 });
 
 test("健康检查：认不出版本字段的宿主一律算过旧", () => {

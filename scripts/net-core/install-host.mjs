@@ -157,7 +157,7 @@ async function main() {
 }
 
 /**
- * 前台直接跑一次运行包（随机端口）：用来区分「包本身跑不起来」和「计划任务被拦/没执行」。
+ * 前台直接跑一次运行包（随机端口）：仅验证直接启动路径，不能代替正式端口与计划任务验证。
  * 不改系统、不长期占用：验完立即结束子进程。
  */
 async function diagnoseHostStartup({ installed, stateDir, token }) {
@@ -200,9 +200,9 @@ const TASK_RESULTS = {
   267008: "任务正在运行（上一次仍在跑）",
   267009: "任务正在运行",
   267010: "任务已排队",
-  267011: "任务从未运行过：被策略/安全软件拦住或任务被禁用",
-  2147942402: "系统找不到指定文件（0x80070002）：启动脚本路径不对",
-  2147942405: "拒绝访问（0x80070005）：安全软件或策略拦截了启动",
+  267011: "任务尚无运行记录：请检查任务启用状态与启动链路",
+  2147942402: "系统找不到指定文件（0x80070002）：请检查启动脚本及其引用路径",
+  2147942405: "拒绝访问（0x80070005）：请检查任务身份、文件权限及系统策略",
   3221225781: "缺少 DLL（0xC0000135）",
   3221225786: "进程被中断（0xC000013A）",
 };
@@ -222,7 +222,7 @@ async function readHostLog(file, lines = 15) {
     if (!text) return "（日志为空）";
     return text.split(/\r?\n/).slice(-lines).join("\n");
   } catch (error) {
-    if (error.code === "ENOENT") return "（日志未生成：启动脚本根本没被执行，优先看下面任务的“上次结果”）";
+    if (error.code === "ENOENT") return "（日志未生成：尚不能确认脚本是否执行，请结合任务“上次结果”检查启动脚本、路径编码及日志写入权限）";
     return `（读不到日志：${error.message}）`;
   }
 }
@@ -297,10 +297,10 @@ async function win32TaskDiagnostics(plan, hostPort, installed, stateDir, token) 
   lines.push("[install] 宿主启动日志（最后 15 行）：");
   lines.push(await readHostLog(plan?.hostLog));
   if (plan?.startupLog) lines.push(await readHostLog(plan.startupLog));
-  // 直接跑一遍运行包：能起来 ⇒ 问题在计划任务/安全软件；起不来 ⇒ 包或环境本身的问题。
+  // 随机端口直启绕过了启动脚本与任务环境，只能作为进一步排查的线索。
   const probe = installed ? await diagnoseHostStartup({ installed, stateDir, token }).catch(() => null) : null;
   if (probe?.answered) {
-    lines.push(`[install] 直接启动运行包成功（协议 ${probe.answered.hostProtocol ?? "?"}）：程序本身可运行，失败在计划任务这一层，通常是被安全软件/组策略拦住或任务未被执行。`);
+    lines.push(`[install] 随机端口直接启动运行包已应答（协议 ${probe.answered.hostProtocol ?? "?"}）：仍需检查计划任务启动链路、启动脚本路径编码、运行环境及正式端口；此结果不能证明安全软件或组策略拦截。`);
   } else if (probe) {
     lines.push("[install] 直接启动运行包也失败，它的输出：");
     lines.push(probe.output ? probe.output.split(/\r?\n/).slice(-10).join("\n") : "（无输出，进程已退出）");

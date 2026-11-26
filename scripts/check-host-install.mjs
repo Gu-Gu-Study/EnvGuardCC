@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildInstallCommand, buildWindowsInstallCommand, cleanInstallerOutput, installKernelHost, shellQuote } from './net-core/host-install.mjs';
@@ -22,6 +22,33 @@ test('Windows 首次安装注册开机 SYSTEM 宿主，长期运行且异常恢�
   assert.match(script, /MultipleInstances IgnoreNew/);
   assert.ok(plan.commands.indexOf(settings) > plan.commands.indexOf(create));
   assert.ok(plan.commands.indexOf(settings) < plan.commands.findIndex(step => step.args.includes('/Run')));
+});
+
+test('Windows UTF-8 启动脚本在中文及空格路径下保留参数并写入启动日志', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'checkcc-中文 空格-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateDir = path.join(directory, '状态 目录');
+  const hostScript = path.join(directory, '宿主 fixture.mjs');
+  const binary = path.join(directory, '内核 文件.exe');
+  const plan = buildHostInstallPlan({ platform: 'win32', nodePath: process.execPath, hostScript, stateDir, binary });
+  const launch = plan.files.find(file => file.path === plan.launchFile);
+  assert.match(launch.content, /^@echo off\r\nchcp 65001 >nul\r\n/);
+  assert.ok(launch.content.indexOf('chcp 65001 >nul') < launch.content.indexOf(hostScript));
+  await t.test('真实 cmd 从非 UTF-8 代码页启动受控 fixture', { skip: process.platform !== 'win32' ? '需要 Windows cmd' : false }, async () => {
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(hostScript, 'console.log(JSON.stringify({ args: process.argv.slice(2), nodeOptions: process.env.NODE_OPTIONS, nodePath: process.env.NODE_PATH }));\n', 'utf8');
+    await writeFile(launch.path, launch.content, 'utf8');
+    execFileSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `chcp 936 >nul && call "${plan.launchFile}"`], {
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+      timeout: 10000,
+      env: { ...process.env, NODE_OPTIONS: '--no-warnings', NODE_PATH: directory },
+    });
+    const output = JSON.parse((await readFile(plan.startupLog, 'utf8')).trim());
+    assert.deepEqual(output.args, ['--state-dir', stateDir, '--token-file', path.join(stateDir, 'host-token'), '--binary', binary, '--api-port', '39090', '--port', '39091']);
+    assert.equal(output.nodeOptions, undefined);
+    assert.equal(output.nodePath, undefined);
+  });
 });
 
 test('macOS 重装等待旧作业退出，未退出或权限失败不能继续 bootstrap', async () => {

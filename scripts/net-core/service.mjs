@@ -58,7 +58,8 @@ export function buildHostInstallPlan({ platform = process.platform, nodePath, ho
     // 否则“宿主未及时应答”永远只能猜（缺模块 / 端口被占 / 安全软件拦载都长一样）。
     const hostLog = paths.join(stateDir, "host-log.txt");
     const startupLog = paths.join(stateDir, "host-startup.log");
-    const launchContent = ["@echo off", "setlocal DisableDelayedExpansion", 'set "NODE_OPTIONS="', 'set "NODE_PATH="', `${quote(nodePath)} ${quote(hostScript)} ${args.join(" ")} > ${quote(startupLog)} 2>&1`, ""].join("\r\n");
+    // 批处理以 UTF-8 写入；必须在解析中文路径所在行之前切换代码页。
+    const launchContent = ["@echo off", "chcp 65001 >nul", "setlocal DisableDelayedExpansion", 'set "NODE_OPTIONS="', 'set "NODE_PATH="', `${quote(nodePath)} ${quote(hostScript)} ${args.join(" ")} > ${quote(startupLog)} 2>&1`, ""].join("\r\n");
     return {
       platform,
       files: [{ path: launch, content: launchContent, mode: 0o644, note: "计划任务指向该短路径脚本；/TR 有 261 字符上限" }],
